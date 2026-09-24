@@ -17,7 +17,8 @@ DSH 的**会话花费 + 账户余额显示插件**：在**合成器工具行里�
 
 - 加载时什么都不显示；**本会话一个计费 token 都没有时也不显示**（不出现「￥0」）。
 - 没有步数时省掉最后一格：`￥110.00/1.72`。
-- **余额取不到时省掉第一格**：`￥1.72/0.011`（此时悬停会说明为什么取不到）。
+- **余额取不到时省掉第一格**：`￥1.72/0.011`（此时悬停会说明**为什么**取不到、以及**是哪条路**失败）。
+- 余额能拿到时，悬停里会标来源：**（账号登录态）**= 桌面端账号服务，**（API key）**= 宿主路由。
 
 ## 安装
 
@@ -62,19 +63,54 @@ dsh plugin --profile web remove dsh-billing
 
 ## 账户余额是怎么来的
 
-余额是**真实账户余额**，由宿主半去问 DeepSeek 的官方接口
-（`GET https://api.deepseek.com/user/balance`），不是估算：
+余额是**真实账户余额**，按优先级走**两条路**（第一条不行才走第二条）：
 
-1. 宿主半用 `ctx.credentials.resolve('DEEPSEEK_API_KEY')` 拿到 key（就是你配置里
-   provider 的那个 `apiKeyEnv`）；
-2. 带着 `Authorization: Bearer <key>` 查询余额，进程内缓存 10 秒（多个页面共享一次查询）；
-3. 挂一个只读路由 `GET /dsh-billing/balance`，**只回数字**：
-   `{ ok: true, available, currency, total, granted, toppedUp }`，失败时是 `{ ok: false, reason }`；
-4. 浏览器半每 20 秒轮询这个同源路由（`?fresh=1` 可跳过宿主的 10 秒缓存）。
+### 路 1：桌面端账号服务（推荐，不需要 API key）
+
+DSH 桌面端自带账号服务，余额直接问它：
+
+```js
+const service = ctx.get('remote.account')          // 可选读取，不存在时返回 undefined
+const result = await service.getBalance()
+// result = null
+//        | { ok: true, value: { status: 'ready',
+//              value: [{ currency: 'CNY'|'USD', balance: '110.00' }],
+//              bonusWallets: [{ currency, balance }] } }
+//        | { ok: true, value: { status: 'failed' } }
+```
+
+- 走的是**账号登录态**（`deepseek-account-platform`），所以**不需要 `DEEPSEEK_API_KEY`**。
+- `balance` 是**字符串**（上游为保精度这么给），插件内部用 `Number()` 转。
+- 取「充值余额」优先 CNY，没有 CNY 就用第一条；赠金余额累加后放进悬停提示。
+- 只在**桌面端**存在；`dsh web` 里没有这个服务。
+
+> **为什么用 `ctx.get('remote.account')` 而不是 `ctx.remote.account`**：
+> 后者要求这个服务先在 `inject` 里声明成**必需**，而它在 `dsh web` 里不存在 ——
+> 声明进去会让插件在 web 端因「必需服务缺失」**整个加载不起来**。
+> cordis 源码原话：`ctx.get(name)` = *"Read a service from the store without the inject requirement."*
+> 所以 `inject` 只声明 `['slots']`，账号服务走可选读取。
+
+### 路 2：宿主半的只读路由（兜底）
+
+路 1 不可用时（web 端 / 未登录 / 旧版 DSH），退回插件自己挂的路由：
+
+1. 宿主半用 `ctx.credentials.resolve('DEEPSEEK_API_KEY')` 拿到 key（就是 provider 的 `apiKeyEnv`）；
+2. 带 `Authorization: Bearer <key>` 查 `GET https://api.deepseek.com/user/balance`，进程内缓存 10 秒；
+3. 挂只读路由 `GET /dsh-billing/balance`，**只回数字**：
+   `{ ok: true, available, currency, total, granted, toppedUp }`，失败时 `{ ok: false, reason }`；
+4. 浏览器半每 20 秒轮询（`?fresh=1` 可跳过 10 秒缓存）。
 
 **API key 永远不出宿主进程**：响应体和页面里都不含 key，页面只拿到一个数字。
 要换自建/代理端点，改 `src/host.js` 顶部的 `BALANCE_URL`；要换凭据名，改 `API_KEY_REF`。
 
+### 两条路都失败时
+
+省略余额那一格，只显示 `￥总花费/每步`；悬停会写明失败原因和**是哪条路**失败
+（如 `account-signed-out` = 桌面端没登录、`no-credential` = web 端没配 API key）。
+
+### 想看当前走的是哪条路
+
+把鼠标悬停在花费文字上：余额后面会标 **（账号登录态）** 或 **（API key）**。
 ## 它是怎么工作的
 
 | 半 | 文件 | 干什么 |
@@ -193,8 +229,11 @@ dsh plugin --profile web remove dsh-billing   # 卸载
   `tests\smoke.mjs` 里已加回归断言：不得撑满整行、不得负外边距）。
 - 这个位置**只在有会话时存在**（槽位 scope 是 session）；工具行很窄时它会跟整组右侧控件
   一起换行，不会挤掉模型名或发送键。
-- **余额那格依赖三件事**：本机能否访问 `api.deepseek.com`、`DEEPSEEK_API_KEY` 能否解析、
-  账号是否在官方端点（自建/代理端没有 `/user/balance`）。任一条不满足就只显示后两格，
-  不影响会话花费的准确性。余额 20 秒轮询一次，所以刚花掉的钱最多晚 20 秒才反映到余额上
-  （会话花费是投影驱动的，立刻更新）。
+- **余额那格的依赖分两条路**：
+  - 桌面端（路 1）：需要**账号已登录**（`signed-out` / 登录过期时就取不到）。
+  - web / 兜底（路 2）：需要本机能访问 `api.deepseek.com`、`DEEPSEEK_API_KEY` 能解析、
+    账号在官方端点（自建/代理端没有 `/user/balance`）。
+
+  两条都失败只影响余额那一格，**不影响会话花费的准确性**。余额 20 秒轮询一次，所以刚花掉的钱
+  最多晚 20 秒才反映到余额上（会话花费是投影驱动的，立刻更新）。
 - 余额**只读不写**：插件不会去充值、不会改账号设置，只调用那一个 GET 接口。

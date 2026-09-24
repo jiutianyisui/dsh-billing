@@ -37,8 +37,19 @@ const PRICES = {
 
 const React = require('react')
 
-/** 宿主半挂的余额路由（同源）。 */
+/**
+ * 余额来源，按优先级：
+ *   1. 桌面端：宿主的账号服务 ctx.remote.account.getBalance()
+ *      —— 走的是**账号登录态**，不需要 API key，余额最准（含赠金余额）。
+ *   2. 其它环境（dsh web / 没有账号服务）：退回宿主半那个只读路由
+ *      /dsh-billing/balance —— 它用 DEEPSEEK_API_KEY 去问官方接口。
+ *
+ * 两条路返回的数据形状不同，下面 readBalance() 负责归一成同一份 { ok, currency, total }。
+ */
 const BALANCE_URL = '/dsh-billing/balance'
+
+/** 桌面端账号服务所在的服务名（见插件 inject 声明）。 */
+const ACCOUNT_SERVICE = 'remote.account'
 
 /** 余额轮询间隔；余额只在花钱时变，不必更勤。 */
 const BALANCE_POLL_MS = 20_000
@@ -105,10 +116,14 @@ function hoverHint(total, perStep, balance, currency, balanceBody, modelId, pric
   const reason = balanceBody === null || balanceBody === undefined
     ? '宿主没应答'
     : String(balanceBody.reason)
+  // 说明余额是哪条路拿到的：account = 桌面端账号服务（登录态），route = 宿主半用 API key 查的
+  const via = balanceBody === null || balanceBody === undefined || balanceBody.source === undefined
+    ? ''
+    : balanceBody.source === 'account' ? '（账号登录态）' : '（API key）'
   const parts = [
     balance === null || balance === undefined
       ? '账户余额取不到（' + reason + '）'
-      : '账户余额 ' + symbol(currency) + money2(balance),
+      : '账户余额 ' + symbol(currency) + money2(balance) + via,
     '总花费 ￥' + money(total),
   ]
   if (perStep !== null) parts.push('每步 ￥' + money(perStep))
@@ -117,20 +132,153 @@ function hoverHint(total, perStep, balance, currency, balanceBody, modelId, pric
 }
 
 /**
- * 轮询宿主半的余额。失败就保留上一次的值；一直失败就一直不显示余额。
- * @returns 最近一次应答体，或 null（还没拿到）。
+ * 浏览器根上下文。apply() 时存进来，供 BillingPill 取 ctx.remote.account。
+ * 用模块级格子而不是 props：槽位组件收到的 props 由宿主决定，我们自己夹带不了。
+ */
+const clientCtx = { value: null }
+
+/**
+ * 把「桌面端账号服务」的余额结果归一成统一形状。
+ *
+ * 宿主 ctx.remote.account.getBalance() 的返回（zod schema 抄自 DSH 本体）：
+ *   null
+ *   | { status: 'ready', value: [{ currency:'CNY'|'USD', balance:string }],
+ *       bonusWallets: [{ currency, balance }] }
+ *   | { status: 'failed' }
+ *
+ * 注意 balance 是**字符串**（保留精度），要用 Number() 转。
+ * 取「充值余额」优先 CNY；没有 CNY 就拿第一条。
+ *
+ * @param result - ctx.remote.account.getBalance() 的返回值，或抛错时为 undefined。
+ * @returns {{ok:boolean, currency?:string, total?:number, granted?:number, source:string, reason?:string}}
+ */
+function normalizeAccountBalance(result) {
+  if (result === null || result === undefined) return { ok: false, reason: 'account-null', source: 'account' }
+  if (!result.ok) return { ok: false, reason: 'account-rpc-failed', source: 'account' }
+  const value = result.value
+  if (value === null || value === undefined) return { ok: false, reason: 'account-signed-out', source: 'account' }
+  if (value.status !== 'ready') return { ok: false, reason: 'account-' + String(value.status), source: 'account' }
+
+  const wallets = Array.isArray(value.value) ? value.value : []
+  const wallet = wallets.find((w) => w !== null && w !== undefined && w.currency === 'CNY')
+    ?? wallets[0]
+  if (wallet === null || wallet === undefined) return { ok: false, reason: 'account-no-wallet', source: 'account' }
+
+  const total = Number(wallet.balance)
+  if (!Number.isFinite(total)) return { ok: false, reason: 'account-no-balance-field', source: 'account' }
+
+  // 赠金余额：加起来只为了悬停时能说明构成，不影响主显示
+  const bonusList = Array.isArray(value.bonusWallets) ? value.bonusWallets : []
+  const granted = bonusList.reduce((sum, w) => {
+    const n = w === null || w === undefined ? Number.NaN : Number(w.balance)
+    return Number.isFinite(n) ? sum + n : sum
+  }, 0)
+
+  return { ok: true, currency: wallet.currency, total, granted, source: 'account' }
+}
+
+/**
+ * 读一次余额，按优先级试两条路：
+ *   1. 桌面端账号服务（ctx.remote.account.getBalance）—— 不用 API key
+ *   2. 宿主半的只读路由（/dsh-billing/balance）—— 用 DEEPSEEK_API_KEY
+ *
+ * 任何一步失败都不抛，返回统一的 { ok, reason, source }，让上层决定显示什么。
+ *
+ * @param ctx - 浏览器根上下文（用来拿 ctx.remote.account）。
+ * @returns 统一形状的余额结果。
+ */
+async function readBalance(ctx) {
+  // ---- 路 1：桌面端账号服务 ----
+  // 用 ctx.get 做**可选**读取：服务不在（web 端）就返回 undefined，不会让插件挂掉。
+  // 直接写 ctx.remote.account 是不行的 —— 那要求它先在 inject 里声明成必需。
+  const account = lookupAccountService(ctx)
+  if (account !== undefined && account !== null && typeof account.getBalance === 'function') {
+    try {
+      const normalized = normalizeAccountBalance(await account.getBalance())
+      // 账号服务拿不到（没登录 / 过期）时，别就此放弃 —— 继续走路由那条
+      if (normalized.ok) return normalized
+      const viaRoute = await readBalanceViaRoute()
+      return viaRoute.ok ? viaRoute : normalized
+    } catch {
+      // 服务抛错也退回路由
+    }
+  }
+
+  // ---- 路 2：宿主半的只读路由 ----
+  return readBalanceViaRoute()
+}
+
+/**
+ * 可选地取桌面端账号服务。
+ *
+ * 用 ctx.get('remote.account') 而不是 ctx.remote.account：前者是官方文档里
+ * 「不要求 inject 的读取」，服务不存在时安静地返回 undefined；后者会在
+ * 服务缺失时抛「cannot get property without inject」。
+ *
+ * @param ctx - 浏览器根上下文。
+ * @returns 账号服务对象，或 undefined。
+ */
+function lookupAccountService(ctx) {
+  if (ctx === null || ctx === undefined || typeof ctx.get !== 'function') return undefined
+  try {
+    return ctx.get('remote.account')
+  } catch {
+    return undefined
+  }
+}
+
+/** 走宿主半的只读路由取余额（web 端 / 没账号服务时的兜底）。 */
+async function readBalanceViaRoute() {
+  try {
+    const response = await fetch(BALANCE_URL, {
+      credentials: 'same-origin',
+      headers: { accept: 'application/json' },
+    })
+    if (!response.ok) return { ok: false, reason: 'route-http-' + String(response.status), source: 'route' }
+    const json = await response.json()
+    if (json === null || json === undefined) return { ok: false, reason: 'route-empty', source: 'route' }
+    if (json.ok !== true) {
+      return { ok: false, reason: json.reason === undefined ? 'route-failed' : String(json.reason), source: 'route' }
+    }
+    return {
+      ok: true,
+      currency: typeof json.currency === 'string' ? json.currency : 'CNY',
+      total: typeof json.total === 'number' ? json.total : Number(json.total),
+      granted: typeof json.granted === 'number' ? json.granted : undefined,
+      source: 'route',
+    }
+  } catch (error) {
+    return { ok: false, reason: 'route-error', source: 'route' }
+  }
+}
+
+/**
+ * 轮询余额：优先桌面端账号服务，失败退回宿主路由。
+ * 失败就保留上一次的值；一直失败就一直不显示余额。
+ *
+ * @param ctx - 浏览器根上下文。
+ * @returns 最近一次归一化后的余额结果，或 null（还没拿到）。
  */
 function useBalance() {
   const [body, setBody] = React.useState(null)
   React.useEffect(() => {
     let alive = true
     const load = () => {
-      fetch(BALANCE_URL, { credentials: 'same-origin', headers: { accept: 'application/json' } })
-        .then((response) => (response.ok ? response.json() : null))
-        .then((json) => {
-          if (alive && json !== null && json !== undefined) setBody(json)
+      readBalance(clientCtx.value).then((result) => {
+        if (!alive) return
+        // 拿到成功结果就更新；失败时保留上一次的成功值（不要闪没）。
+        // 值没变就返回原对象 —— 否则每 20 秒都会产生一个新对象，
+        // 让 React 白白重渲染一次。
+        setBody((prev) => {
+          const next = result.ok || prev === null || prev === undefined || !prev.ok ? result : prev
+          if (prev !== null && prev !== undefined
+              && prev.ok === next.ok && prev.total === next.total
+              && prev.currency === next.currency && prev.source === next.source) {
+            return prev
+          }
+          return next
         })
-        .catch(() => {})
+      }).catch(() => {})
     }
     load()
     const timer = setInterval(load, BALANCE_POLL_MS)
@@ -163,6 +311,7 @@ function BillingPill(props) {
   const usage = props.useProjection('tokenUsage')
   const stats = props.useProjection('sessionStats')
   const selection = props.useProjection('modelSelection')
+  // ctx 由 apply() 存进 clientCtx；槽位 props 由宿主决定，拿不到 ctx，所以走模块级格子
   const balanceBody = useBalance()
 
   const used = selection === null || selection === undefined
@@ -195,6 +344,9 @@ function BillingPill(props) {
  * @param ctx - 浏览器根上下文。
  */
 function apply(ctx) {
+  // 存起来给 BillingPill 用（槽位 props 由宿主决定，夹带不了 ctx）
+  clientCtx.value = ctx
+
   ctx.slots.inject('conversation.input.right', () => ctx.slots.register(
     { name: 'conversation.input.right', id: 'billing', order: 10 },
     BillingPill,
@@ -202,6 +354,15 @@ function apply(ctx) {
 }
 
 exports.apply = apply
+// 只声明**一定有**的服务。
+//
+// remote.account 是桌面端的账号服务（ctx.remote.account.getBalance()），
+// 走账号登录态、不需要 API key；但它在 dsh web 里**不存在**。
+// 若把它写进 inject，插件在 web 端会因「必需服务缺失」而整个加载不起来 ——
+// 所以改用官方推荐的**可选读取**：ctx.get('remote.account')。
+//   （cordis 源码原话：ctx.get(name) = "Read a service from the store
+//     without the inject requirement."）
+// 拿不到就退回宿主半那个 /dsh-billing/balance 路由（用 API key 查）。
 exports.inject = ['slots']
 // 只给离线冒烟测试用（装载契约只读 apply / inject）
-exports.__internals = { sessionCost, money, money2, symbol, formatCost, hoverHint }
+exports.__internals = { sessionCost, money, money2, symbol, formatCost, hoverHint, normalizeAccountBalance, readBalance, lookupAccountService }

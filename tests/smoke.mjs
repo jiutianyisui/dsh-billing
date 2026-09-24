@@ -19,7 +19,14 @@ const source = readFileSync(join(root, 'lib', 'client.js'), 'utf8')
 
 // ---- 1. 装载：模拟 __ModuleLoader__ 的 queue 模式 -----------------------------
 let registration
-const sandbox = { window: { __ModuleLoader__: { load: (row) => { registration = row } } }, console }
+// 沙箱里放一个**可替换**的 fetch：模块在 vm 上下文里求值，它看到的 fetch 是这个，
+// 而测试文件里的 globalThis.fetch 到不了那边。默认实现是「网络不可用」，需要时替换。
+let sandboxFetch = async () => { throw new Error('fetch not stubbed') }
+const sandbox = {
+  window: { __ModuleLoader__: { load: (row) => { registration = row } } },
+  console,
+  fetch: (...args) => sandboxFetch(...args),
+}
 vm.runInNewContext(source, sandbox, { filename: 'lib/client.js' })
 
 assert.equal(registration.id, 'dsh-billing', '注册的 id 必须是包名（= 插件图行 id）')
@@ -214,5 +221,114 @@ const hint = internals.hoverHint(3.4, 0.034, null, undefined, { ok: false, reaso
   miss: 1, hit: 0.02, out: 4,
 })
 assert.ok(hint.includes('no-credential'), '余额取不到时要说明原因')
+
+// ---- 7. 双路余额：桌面端账号服务优先，退回宿主路由 --------------------------
+// 起因：本机没有 DEEPSEEK_API_KEY，余额一直取不到；而 DSH 桌面端自带
+// ctx.remote.account.getBalance()（账号登录态），不需要 API key。所以做成双路。
+{
+  const nb = internals.normalizeAccountBalance
+
+  // --- 账号服务返回值的归一化 ---
+  const cny = nb({ ok: true, value: { status: 'ready', value: [{ currency: 'CNY', balance: '110.00' }], bonusWallets: [] } })
+  assert.equal(cny.ok, true, '账号服务：ok')
+  assert.equal(cny.currency, 'CNY', '账号服务：币种')
+  assert.equal(cny.total, 110, '账号服务：CNY 余额是数字 110')
+  assert.equal(cny.granted, 0, '账号服务：没有赠金时 granted 为 0')
+  assert.equal(cny.source, 'account', '账号服务：来源标记')
+  // balance 是字符串，必须转成数字（保留精度是上游的要求）
+  const usd = nb({ ok: true, value: { status: 'ready', value: [{ currency: 'USD', balance: '15.50' }], bonusWallets: [] } })
+  assert.equal(usd.total, 15.5)
+  assert.equal(usd.currency, 'USD')
+  // 没有 CNY 时用第一条
+  assert.equal(
+    nb({ ok: true, value: { status: 'ready', value: [{ currency: 'USD', balance: '1' }], bonusWallets: [] } }).currency,
+    'USD',
+    '没有 CNY 就用第一条钱包',
+  )
+  // 赠金余额累加
+  assert.equal(
+    nb({ ok: true, value: { status: 'ready', value: [{ currency: 'CNY', balance: '10' }], bonusWallets: [{ currency: 'CNY', balance: '2.5' }, { currency: 'USD', balance: '3' }] } }).granted,
+    5.5,
+    '赠金余额累加成 granted',
+  )
+  // 失败/未登录/空钱包
+  assert.equal(nb(null).ok, false, '账号服务返回 null -> 不 ok')
+  assert.equal(nb(null).reason, 'account-null')
+  assert.equal(nb({ ok: false }).reason, 'account-rpc-failed', 'RPC 失败')
+  assert.equal(nb({ ok: true, value: null }).reason, 'account-signed-out', '未登录')
+  assert.equal(nb({ ok: true, value: { status: 'failed' } }).reason, 'account-failed', '账号服务报 failed')
+  assert.equal(
+    nb({ ok: true, value: { status: 'ready', value: [], bonusWallets: [] } }).reason,
+    'account-no-wallet',
+    '没有钱包',
+  )
+  assert.equal(
+    nb({ ok: true, value: { status: 'ready', value: [{ currency: 'CNY', balance: 'abc' }], bonusWallets: [] } }).reason,
+    'account-no-balance-field',
+    '余额不是数字',
+  )
+
+  // --- lookupAccountService：可选读取，缺失时不抛 ---
+  assert.equal(internals.lookupAccountService(undefined), undefined, '没有 ctx -> undefined')
+  assert.equal(internals.lookupAccountService({}), undefined, 'ctx 没有 get -> undefined')
+  assert.equal(
+    internals.lookupAccountService({ get: () => { throw new Error('missing') } }),
+    undefined,
+    'ctx.get 抛错也要安静地返回 undefined（web 端就是这条）',
+  )
+  const fakeService = { getBalance: async () => ({ ok: true }) }
+  assert.equal(
+    internals.lookupAccountService({ get: (n) => (n === 'remote.account' ? fakeService : undefined) }),
+    fakeService,
+    "ctx.get('remote.account') 能拿到服务",
+  )
+
+  // --- readBalance：优先级与兜底 ---
+  const savedFetch = sandboxFetch
+  try {
+    // 路 1 成功：不该去 fetch
+    let fetchCount = 0
+    sandboxFetch = async () => { fetchCount += 1; throw new Error('不该走这条') }
+    const viaAccount = await internals.readBalance({
+      get: () => ({ getBalance: async () => ({ ok: true, value: { status: 'ready', value: [{ currency: 'CNY', balance: '88' }], bonusWallets: [] } }) }),
+    })
+    assert.equal(viaAccount.ok, true)
+    assert.equal(viaAccount.total, 88)
+    assert.equal(viaAccount.source, 'account', '桌面端走账号服务')
+    assert.equal(fetchCount, 0, '账号服务成功时不该再打路由')
+
+    // 路 1 不可用（web）-> 退回路由
+    sandboxFetch = async () => ({ ok: true, json: async () => ({ ok: true, currency: 'CNY', total: 42 }) })
+    const viaRoute = await internals.readBalance({ get: () => undefined })
+    assert.equal(viaRoute.ok, true)
+    assert.equal(viaRoute.total, 42, '没有账号服务时退回路由')
+    assert.equal(viaRoute.source, 'route')
+
+    // 路 1 未登录 + 路 2 也失败 -> 返回账号服务那边的原因（更有信息量）
+    sandboxFetch = async () => ({ ok: true, json: async () => ({ ok: false, reason: 'no-credential' }) })
+    const bothFail = await internals.readBalance({
+      get: () => ({ getBalance: async () => ({ ok: true, value: null }) }),
+    })
+    assert.equal(bothFail.ok, false)
+    assert.equal(bothFail.reason, 'account-signed-out', '两条都失败时给账号服务的原因')
+
+    // 路 1 抛错 -> 安静退回路 2
+    sandboxFetch = async () => ({ ok: true, json: async () => ({ ok: true, currency: 'CNY', total: 7 }) })
+    const threw = await internals.readBalance({
+      get: () => ({ getBalance: async () => { throw new Error('rpc down') } }),
+    })
+    assert.equal(threw.ok, true)
+    assert.equal(threw.total, 7, '账号服务抛错要退回路由')
+
+    // 路由 HTTP 非 2xx
+    sandboxFetch = async () => ({ ok: false, status: 502 })
+    assert.equal((await internals.readBalance({ get: () => undefined })).reason, 'route-http-502')
+    // 网络异常
+    sandboxFetch = async () => { throw new Error('offline') }
+    assert.equal((await internals.readBalance({ get: () => undefined })).reason, 'route-error')
+  } finally {
+    sandboxFetch = savedFetch
+  }
+}
 
 console.log('dsh-billing smoke: all checks passed')
