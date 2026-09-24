@@ -1,0 +1,13 @@
+# dsh-billing bundle patch: inserts this package's own plugin row.
+#
+# This file is what makes the package installable as a bundle: `dsh plugin add`
+# / the plugin manager read `dsh.bundle.patch` from package.json and apply the
+# patch below as one profile layer. Without it the package is only a plain
+# dependency and installation fails with "declares no dsh.bundle".
+#
+# `name` must be the package name so node resolves lib/index.js through the
+# package's own `exports`; the row id is what a user's profile patch targets to
+# override or disable this plugin.
+- insert:
+    - id: dsh-billing
+      name: dsh-billing

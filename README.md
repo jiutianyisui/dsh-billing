@@ -21,17 +21,43 @@ DSH 的**会话花费 + 账户余额显示插件**：在**合成器工具行里�
 
 ## 安装
 
+本包是一个 **DSH 组合包（bundle）**：`package.json` 里声明了
+`dsh.bundle.patch`，由 `cordis.patch.yml` 插入插件行。所以两种装法都行：
+
 ```powershell
+# 方式一：官方 CLI（推荐）——自动写入依赖并登记进 dsh.profile.bundles
 git clone https://github.com/jiutianyisui/dsh-billing.git
+dsh plugin --profile web add .\dsh-billing
+
+# 方式二：仓库自带脚本（内部就是调上面那条命令）
 cd dsh-billing
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1     # 装进 %USERPROFILE%\.dsh\profiles\web
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-装完**刷新页面**；没出现就重启 `dsh web`。卸载用
-`powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1`。
+装完**刷新页面**；没出现就重启 `dsh web`。卸载：
 
-> 请把仓库克隆到**纯 ASCII 且无空格**的路径下：`dsh plugin add <路径>` 在 Windows 上
-> 会把含非 ASCII 的路径拆坏，`install.ps1` 没有这个限制。
+```powershell
+dsh plugin --profile web remove dsh-billing
+# 或：powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
+```
+
+装好后 `%USERPROFILE%\.dsh\profiles\web\package.json` 会出现：
+
+```json
+{
+  "dsh": { "profile": { "bundles": ["...", "dsh-billing"] } },
+  "dependencies": { "dsh-billing": "link:E:/path/to/dsh-billing" }
+}
+```
+
+> **为什么必须声明 `dsh.bundle.patch`**：DSH 把 `dsh.profile.bundles` 里的每个包
+> 当作一个组合层加载；包若没有 `dsh.bundle`，`dsh plugin add` 会以
+> `not-a-bundle`（`declares no dsh.bundle`）拒绝安装，启动时也只当成普通依赖。
+> 另：`dsh.client.platform` 与 `dsh.bundle` **同时存在**——前者让浏览器半被扫描进
+> `window.__DSH_BOOT__`，后者让 Node 半成为一个组合层。
+>
+> **不要手工往 profile 的 `cordis.patch.yml` 插块**（旧版 `install.ps1` 的做法）：
+> 那条路径绕过了 `dsh.profile.bundles`，pnpm 下次 install 会把链接丢掉，插件静默消失。
 
 
 ## 账户余额是怎么来的
@@ -106,10 +132,12 @@ dsh-billing\
 ├── src\host.js        Node 半源码
 ├── lib\client.js      构建产物：页面真正执行的那段（勿手改）
 ├── lib\index.js       构建产物：Node 半
+├── cordis.patch.yml   组合包 patch：插入本包的插件行（缺它就不能作为 bundle 安装）
 ├── tests\smoke.mjs    浏览器半离线冒烟（模拟模块表装载 + 假投影，断言槽位/文本/版式）
 ├── tests\host.mjs     Node 半离线测试（假 ctx 驱动路由：成功/无凭据/4xx/超时/缓存/key 不外泄）
+├── tests\bundle.mjs   清单自检（复现 DSH 的 bundlePatchFiles 校验 + 组合包字段完整性）
 ├── build.ps1          装配 lib\（无打包器，只做拼接）
-├── install.ps1        装进 web profile（junction + patch 条目）
+├── install.ps1        装进 profile（调 dsh plugin add）
 ├── uninstall.ps1      卸载
 ├── LICENSE            MIT
 └── .gitignore
@@ -127,28 +155,26 @@ dsh-billing\
 powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1      # 改完 src 必跑
 node .\tests\smoke.mjs              # 浏览器半自检（装载契约 + 金额格式 + 版式回归）
 node .\tests\host.mjs               # Node 半自检（余额路由 + 缓存 + 错误分支 + key 不外泄）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1    # 装进 %USERPROFILE%\.dsh\profiles\web
-powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1  # 卸载
+node .\tests\bundle.mjs .           # 清单自检（dsh.bundle / exports / files 完整性）
+dsh plugin --profile web add .      # 安装（= install.ps1 内部执行的命令）
+dsh plugin --profile web remove dsh-billing   # 卸载
 ```
 
-`install.ps1` 做两件事，都可以手工完成，也可以手工回滚：
+`install.ps1` 实际只做一件事：调用 `dsh plugin --profile web add <本目录>`。
+这条命令由 profile 自己的 pnpm 执行，替我们完成两步：
 
-1. 在 profile 的 `node_modules` 下建 **junction** `dsh-billing` → 本目录。
-   （用链接而不是 `file:` 拷贝，是为了让本目录就是唯一真相，改完 build 即生效。
-   注意：`dsh plugin add <路径>` 在 Windows 上会把**含空格或非 ASCII 的路径**拆坏
-   —— 请把本仓库放在**纯 ASCII 且无空格**的路径下，或直接用 `install.ps1`。）
-2. 在 profile 的 `cordis.patch.yml` 末尾插入一段带标记的 `- insert:` 条目：
+1. 在 profile 的 `package.json` 里写入依赖
+   `"dsh-billing": "link:<本目录>"`（`link:` 让本目录始终是唯一真相，
+   改完 `build.ps1` 立即生效，不必重装）；
+2. 把 `"dsh-billing"` 追加进 `dsh.profile.bundles`——DSH 据此把本包的
+   `cordis.patch.yml` 当作一个组合层加载。
 
-```yaml
-# >>> dsh-billing
-- insert:
-    - id: dsh-billing
-      name: dsh-billing
-# <<< dsh-billing
-```
+因此**不需要**（也不应该）手工去建 junction 或改 profile 的 `cordis.patch.yml`：
+`dsh.profile.bundles` 才是注册插件层的正式途径。装/卸是幂等的，
+`package.json` 与 `pnpm-lock.yaml` 都可以手工回滚。
 
-改完 patch **刷新页面**即可（profile 是 `patchReload: live`）；若刷新后仍不出现，
-重启 `dsh web`（新插件条目需要新的 Loader 组合）。卸载后同样刷新一次。
+装完**刷新页面**即可；若刷新后仍不出现，重启 `dsh web`
+（新插件条目需要新的 Loader 组合）。卸载后同样刷新一次。
 
 ## 已知限制
 

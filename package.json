@@ -11,11 +11,13 @@
     "./client": {
       "default": "./lib/client.js"
     },
+    "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/index.js",
     "lib/client.js",
+    "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
@@ -42,9 +44,12 @@
   },
   "scripts": {
     "build": "powershell -NoProfile -ExecutionPolicy Bypass -File ./build.ps1",
-    "test": "node ./tests/smoke.mjs && node ./tests/host.mjs"
+    "test": "node ./tests/smoke.mjs && node ./tests/host.mjs && node ./tests/bundle.mjs ."
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web"
     }

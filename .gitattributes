@@ -13,6 +13,10 @@ src/** text eol=lf
 *.js   text eol=lf
 *.json text eol=lf
 
+# YAML：cordis.patch.yml 由 DSH 加载器直接解析，行尾必须稳定
+*.yml  text eol=lf
+*.yaml text eol=lf
+
 # 二进制/资源不做转换
 *.png binary
 *.jpg binary
