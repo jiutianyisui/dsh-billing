@@ -1,0 +1,13 @@
+# 依赖（本插件无运行时依赖，装了也不提交）
+node_modules/
+
+# 编辑器与系统杂物
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# 日志与临时产物
+*.log
+*.tmp

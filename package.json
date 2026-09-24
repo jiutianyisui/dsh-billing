@@ -1,0 +1,52 @@
+{
+  "name": "dsh-billing",
+  "version": "0.1.0",
+  "description": "DSH 计费显示：在模型选择器旁边显示账户余额、本会话总花费与每步花费（￥）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "billing",
+    "cost",
+    "token-usage",
+    "deepseek"
+  ],
+  "license": "MIT",
+  "author": "jiutianyisui",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiutianyisui/dsh-billing.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jiutianyisui/dsh-billing/issues"
+  },
+  "homepage": "https://github.com/jiutianyisui/dsh-billing#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File ./build.ps1",
+    "test": "node ./tests/smoke.mjs && node ./tests/host.mjs"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  }
+}

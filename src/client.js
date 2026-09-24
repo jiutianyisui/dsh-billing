@@ -1,0 +1,207 @@
+// ---------------------------------------------------------------------------
+// dsh-billing —— 浏览器半（真正跑在页面里的那一段）
+//
+// 这个文件不经过任何打包器：build.ps1 把它整段塞进
+//   window.__ModuleLoader__.load({ id: 'dsh-billing', factory: (require) => { ... } })
+// 的 factory 里，所以：
+//   * 只能 require() 模块表里已有的条目（react / react-dom / react/jsx-runtime /
+//     @deepseek-ai/cordis / @deepseek-ai/dsh-client-ui-slots / …），拿不到别的 npm 包；
+//   * 不能写 import，也不能写 JSX（React 元素一律 React.createElement）。
+//
+// 落点：合成器工具行 conversation.input.right —— 就是「模型选择器左边那一格」，
+// 与模型名同排同字号（13px/20px）。显示 `￥账户余额/本会话总花费/每步`，例如
+//   ￥110.00/1.72/0.011
+// 账户余额来自宿主半的只读路由（见 src/host.js）；取不到时只显示后两个数。
+// （不要挪回 conversation.composer.dock：那里每个条目独占一行，挤不进统计条那一行。）
+// ---------------------------------------------------------------------------
+
+// ===========================================================================
+// 价格表 —— 想调价只改这一段。单位：￥ / 每百万 token
+//
+//   miss = 输入·未命中缓存      hit = 输入·命中缓存      out = 输出
+//   缓存写入（cacheWrite）按 miss 计价（DeepSeek 不单独收缓存写入费）。
+//
+//   数值来源：本库「90 系统文件/Agent记忆/可靠记忆索引.md → 会话成本与用量（实测）」
+//   实测的 deepseek-flash **空闲时段**单价（命中 0.02 / 未命中 1 / 输出 4）。
+//   高峰时段是 ×2 —— 要按高峰算就把三档都乘 2。
+//   其余模型没有实测记录，先沿用同一组数，请按你自己的账单改。
+// ===========================================================================
+const PRICES = {
+  'deepseek-flash': { miss: 1, hit: 0.02, out: 4 },
+  'deepseek-v4-flash': { miss: 1, hit: 0.02, out: 4 },
+  'deepseek-v4-pro': { miss: 1, hit: 0.02, out: 4 },
+  'deepseek-v4-flash-vision-exp': { miss: 1, hit: 0.02, out: 4 },
+  // 价格表里没有的模型走这一行
+  default: { miss: 1, hit: 0.02, out: 4 },
+}
+
+const React = require('react')
+
+/** 宿主半挂的余额路由（同源）。 */
+const BALANCE_URL = '/dsh-billing/balance'
+
+/** 余额轮询间隔；余额只在花钱时变，不必更勤。 */
+const BALANCE_POLL_MS = 20_000
+
+/** 非负数字守卫：投影缺字段、为 null 或负数都当 0。 */
+function count(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/**
+ * 本会话累计花费（￥）。
+ * @param usage - tokenUsage 投影值（缺能力时为 undefined）。
+ * @param prices - 该模型的价格行。
+ * @returns 金额；一个计费 token 都没有时返回 null（此时不显示）。
+ */
+function sessionCost(usage, prices) {
+  if (usage === null || typeof usage !== 'object') return null
+  const miss = count(usage.uncachedInputTokens) + count(usage.cacheWriteTokens)
+  const hit = count(usage.cacheReadTokens)
+  const out = count(usage.outputTokens)
+  if (miss + hit + out === 0) return null
+  return (miss * prices.miss + hit * prices.hit + out * prices.out) / 1e6
+}
+
+/** 花费金额：大钱两位小数，小钱多给几位，别把 0.004￥ 显示成 0.00￥。 */
+function money(value) {
+  if (value >= 1) return value.toFixed(2)
+  if (value >= 0.01) return value.toFixed(3)
+  return value.toFixed(4)
+}
+
+/** 账户余额：固定两位小数（余额本来就是两位小数的报价）。 */
+function money2(value) {
+  return value.toFixed(2)
+}
+
+/** 币种符号：认得出的用符号，认不出的带币种码。 */
+function symbol(currency) {
+  if (currency === 'USD') return '$'
+  if (typeof currency !== 'string' || currency === '' || currency === 'CNY' || currency === 'RMB') return '￥'
+  return currency + ' '
+}
+
+/**
+ * 一行文字：`￥余额/总花费/每步`；没有余额（宿主查不到）时是 `￥总花费/每步`；
+ * 没有步数时省掉最后一段。
+ * @param total - 本会话总花费。
+ * @param perStep - 每步花费，没有步数时为 null。
+ * @param balance - 账户余额，取不到时为 null。
+ * @param currency - 余额币种。
+ * @returns 显示文本。
+ */
+function formatCost(total, perStep, balance, currency) {
+  const tail = perStep === null ? money(total) : money(total) + '/' + money(perStep)
+  if (balance === null || balance === undefined) return '￥' + tail
+  return symbol(currency) + money2(balance) + '/' + tail
+}
+
+/**
+ * 悬停提示：按显示顺序把三个数说清楚，并交代单价口径（以及余额为什么没有）。
+ * @returns 提示文本。
+ */
+function hoverHint(total, perStep, balance, currency, balanceBody, modelId, prices) {
+  const reason = balanceBody === null || balanceBody === undefined
+    ? '宿主没应答'
+    : String(balanceBody.reason)
+  const parts = [
+    balance === null || balance === undefined
+      ? '账户余额取不到（' + reason + '）'
+      : '账户余额 ' + symbol(currency) + money2(balance),
+    '总花费 ￥' + money(total),
+  ]
+  if (perStep !== null) parts.push('每步 ￥' + money(perStep))
+  return parts.join(' ｜ ') + '。按 ' + (modelId === undefined ? '默认' : modelId)
+    + ' 单价估算（￥/百万 token：未命中 ' + prices.miss + '、命中 ' + prices.hit + '、输出 ' + prices.out + '）'
+}
+
+/**
+ * 轮询宿主半的余额。失败就保留上一次的值；一直失败就一直不显示余额。
+ * @returns 最近一次应答体，或 null（还没拿到）。
+ */
+function useBalance() {
+  const [body, setBody] = React.useState(null)
+  React.useEffect(() => {
+    let alive = true
+    const load = () => {
+      fetch(BALANCE_URL, { credentials: 'same-origin', headers: { accept: 'application/json' } })
+        .then((response) => (response.ok ? response.json() : null))
+        .then((json) => {
+          if (alive && json !== null && json !== undefined) setBody(json)
+        })
+        .catch(() => {})
+    }
+    load()
+    const timer = setInterval(load, BALANCE_POLL_MS)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [])
+  return body
+}
+
+// 尺寸、字号、颜色都跟旁边的模型选择器对齐（它自己写死 13px/20px、500 字重）：
+// 不设宽高、不换行，只自己定「次级文字色 + 等宽数字」。
+const LABEL_STYLE = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  color: 'var(--dsw-alias-label-tertiary)',
+  fontSize: '13px',
+  lineHeight: '20px',
+  fontVariantNumeric: 'tabular-nums',
+  whiteSpace: 'nowrap',
+}
+
+/**
+ * 花费条目：￥账户余额/本会话总花费/每步。
+ * @param props - 会话槽位的标准 props（这里只用 useProjection）。
+ * @returns 花费文字，或没有计费 token 时的 null。
+ */
+function BillingPill(props) {
+  const usage = props.useProjection('tokenUsage')
+  const stats = props.useProjection('sessionStats')
+  const selection = props.useProjection('modelSelection')
+  const balanceBody = useBalance()
+
+  const used = selection === null || selection === undefined
+    ? undefined
+    : selection.lastUsed || selection.next
+  const modelId = used === null || used === undefined ? undefined : used.model
+  const prices = PRICES[modelId] || PRICES.default
+
+  const total = sessionCost(usage, prices)
+  if (total === null) return null
+
+  const steps = stats === null || stats === undefined ? 0 : count(stats.steps)
+  const perStep = steps > 0 ? total / steps : null
+
+  const known = balanceBody !== null && balanceBody !== undefined && balanceBody.ok === true
+  const balance = known && typeof balanceBody.total === 'number' && Number.isFinite(balanceBody.total)
+    ? balanceBody.total
+    : null
+  const currency = known ? balanceBody.currency : undefined
+
+  return React.createElement('span', {
+    style: LABEL_STYLE,
+    title: hoverHint(total, perStep, balance, currency, balanceBody, modelId, prices),
+    'data-billing-cost': '',
+  }, formatCost(total, perStep, balance, currency))
+}
+
+/**
+ * 客户端插件体：把花费挂在合成器工具行里（模型选择器左边那一格）。
+ * @param ctx - 浏览器根上下文。
+ */
+function apply(ctx) {
+  ctx.slots.inject('conversation.input.right', () => ctx.slots.register(
+    { name: 'conversation.input.right', id: 'billing', order: 10 },
+    BillingPill,
+  ))
+}
+
+exports.apply = apply
+exports.inject = ['slots']
+// 只给离线冒烟测试用（装载契约只读 apply / inject）
+exports.__internals = { sessionCost, money, money2, symbol, formatCost, hoverHint }

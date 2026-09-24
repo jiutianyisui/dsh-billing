@@ -1,0 +1,20 @@
+# lib\ 是浏览器/Node 直接加载的产物：强制 LF，避免检出时行尾被改写
+lib/** text eol=lf
+
+# 浏览器半源码：同样强制 LF（build.ps1 用 "`n" 拼接）
+src/** text eol=lf
+
+# PowerShell 脚本：CRLF（Windows 原生，且 5.1 对 LF-only 处理有历史坑）
+*.ps1 text eol=crlf
+
+# 文本文件统一规范
+*.md   text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+
+# 二进制/资源不做转换
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
